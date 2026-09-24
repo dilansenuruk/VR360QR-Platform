@@ -5,12 +5,12 @@ import { defineConfig } from 'vite'
 export default defineConfig({
   plugins: [react()],
   server: {
-    // Forwards API/upload requests to the local Express backend so the
-    // browser sees everything as same-origin (localhost:5173) -- this keeps
-    // the session cookie working without any CORS configuration.
+    // Forwards API requests (including thumbnail images, served from
+    // /api/thumbnails/:id) to the local Express backend so the browser sees
+    // everything as same-origin (localhost:5173) -- this keeps the auth
+    // cookie working without any CORS configuration.
     proxy: {
       '/api': 'http://localhost:3001',
-      '/uploads': 'http://localhost:3001',
     },
   },
 })

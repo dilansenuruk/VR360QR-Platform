@@ -12,11 +12,7 @@ dist
 dist-ssr
 *.local
 .env
-
-# Local SQLite database and uploaded thumbnails (runtime data, not source)
-server/data/
-server/uploads/
-!server/uploads/.gitkeep
+.vercel
 
 # Editor directories and files
 .vscode/*

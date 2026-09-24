@@ -101,7 +101,7 @@ export function VideoForm({ initialVideo, onSubmit, onCancel }: VideoFormProps) 
             className="block w-full text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-brand-50 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-brand-700 hover:file:bg-brand-100"
           />
         </div>
-        <p className="mt-1 text-xs text-slate-400">JPG, PNG, or WEBP. Max 5 MB.</p>
+        <p className="mt-1 text-xs text-slate-400">JPG, PNG, or WEBP. Max 4 MB.</p>
         {fileError && <p className="mt-1 text-xs text-danger-600">{fileError}</p>}
       </div>
 

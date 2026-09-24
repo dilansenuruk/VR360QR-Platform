@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { randomBytes } from 'node:crypto';
-import { db, newId } from '../db.ts';
+import { pool, newId } from '../db.ts';
 import { requireAuth, type AuthedRequest } from '../middleware.ts';
 import type { QrGenerationRow, VideoRow } from '../types.ts';
 
@@ -10,6 +10,7 @@ export const qrRouter = Router();
 const TRACKING_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const TRACKING_ID_LENGTH = 8;
 const MAX_INSERT_ATTEMPTS = 10;
+const POSTGRES_UNIQUE_VIOLATION = '23505';
 
 function randomTrackingId(): string {
   const bytes = randomBytes(TRACKING_ID_LENGTH);
@@ -42,26 +43,23 @@ function serializeHistoryRow(row: HistoryRow) {
 
 /**
  * Generates a new QR code for a video. The tracking ID is cryptographically
- * random; because node:sqlite is synchronous, the "does this ID already
- * exist" check and the insert cannot be interleaved by another request, but
- * we still retry on a UNIQUE constraint violation as a hard backstop, so
- * duplicates are structurally impossible even if this logic ever changes.
+ * random. Postgres' UNIQUE constraint on tracking_id/payload is the real
+ * backstop against duplicates -- if an insert ever collides (astronomically
+ * unlikely), we catch the unique_violation error and retry with a fresh ID,
+ * so duplicates are structurally impossible even under concurrent requests.
  */
-qrRouter.post('/qr/generate', requireAuth, (req: AuthedRequest, res) => {
+qrRouter.post('/qr/generate', requireAuth, async (req: AuthedRequest, res) => {
   const { videoId } = req.body as { videoId?: string };
   if (!videoId) return res.status(400).json({ error: 'videoId is required.' });
 
-  const video = db.prepare('SELECT * FROM videos WHERE id = ? AND is_deleted = 0').get(videoId) as
-    | VideoRow
-    | undefined;
+  const { rows: videoRows } = await pool.query<VideoRow>(
+    'SELECT * FROM videos WHERE id = $1 AND is_deleted = false',
+    [videoId]
+  );
+  const video = videoRows[0];
   if (!video) {
     return res.status(404).json({ error: 'Video not found or has been removed.' });
   }
-
-  const insert = db.prepare(
-    `INSERT INTO qr_generations (id, video_id, video_code, tracking_id, payload, generated_by, generated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  );
 
   for (let attempt = 0; attempt < MAX_INSERT_ATTEMPTS; attempt++) {
     const trackingId = randomTrackingId();
@@ -70,7 +68,11 @@ qrRouter.post('/qr/generate', requireAuth, (req: AuthedRequest, res) => {
     const generatedAt = new Date().toISOString();
 
     try {
-      insert.run(id, video.id, video.video_code, trackingId, payload, req.profile!.id, generatedAt);
+      await pool.query(
+        `INSERT INTO qr_generations (id, video_id, video_code, tracking_id, payload, generated_by, generated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [id, video.id, video.video_code, trackingId, payload, req.profile!.id, generatedAt]
+      );
       return res.status(201).json({
         id,
         video_id: video.id,
@@ -82,8 +84,8 @@ qrRouter.post('/qr/generate', requireAuth, (req: AuthedRequest, res) => {
         last_accessed_at: null,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (!message.includes('UNIQUE constraint failed')) {
+      const code = (err as { code?: string }).code;
+      if (code !== POSTGRES_UNIQUE_VIOLATION) {
         console.error('QR generation failed:', err);
         return res.status(500).json({ error: 'Unable to generate QR code. Please try again.' });
       }
@@ -99,51 +101,53 @@ qrRouter.post('/qr/generate', requireAuth, (req: AuthedRequest, res) => {
  * generations server-side (the `all` scope is silently ignored for them) --
  * this is enforced here, not just by what the frontend chooses to request.
  */
-qrRouter.get('/qr/history', requireAuth, (req: AuthedRequest, res) => {
+qrRouter.get('/qr/history', requireAuth, async (req: AuthedRequest, res) => {
   const isAdmin = req.profile!.role === 'admin';
   const { search, dateFrom, dateTo, userId, sort, mine } = req.query as Record<string, string | undefined>;
 
   const conditions: string[] = [];
   const params: unknown[] = [];
+  function addParam(value: unknown): string {
+    params.push(value);
+    return `$${params.length}`;
+  }
 
   // `mine=true` (used by the "My QR Generations" page) always scopes to the
   // logged-in user, even for an admin -- this is enforced here, not left to
   // the client's choice, so it can't be bypassed by omitting the parameter.
   if (!isAdmin || mine === 'true') {
-    conditions.push('g.generated_by = ?');
-    params.push(req.profile!.id);
+    conditions.push(`g.generated_by = ${addParam(req.profile!.id)}`);
   } else if (userId) {
-    conditions.push('g.generated_by = ?');
-    params.push(userId);
+    conditions.push(`g.generated_by = ${addParam(userId)}`);
   }
 
   if (dateFrom) {
-    conditions.push('g.generated_at >= ?');
-    params.push(`${dateFrom}T00:00:00.000Z`);
+    conditions.push(`g.generated_at >= ${addParam(`${dateFrom}T00:00:00.000Z`)}`);
   }
   if (dateTo) {
-    conditions.push('g.generated_at <= ?');
-    params.push(`${dateTo}T23:59:59.999Z`);
+    conditions.push(`g.generated_at <= ${addParam(`${dateTo}T23:59:59.999Z`)}`);
   }
   if (search && search.trim()) {
     const term = `%${search.trim()}%`;
-    conditions.push('(g.payload LIKE ? OR g.tracking_id LIKE ? OR g.video_code LIKE ? OR v.name LIKE ?)');
-    params.push(term, term, term, term);
+    const p1 = addParam(term);
+    const p2 = addParam(term);
+    const p3 = addParam(term);
+    const p4 = addParam(term);
+    conditions.push(`(g.payload ILIKE ${p1} OR g.tracking_id ILIKE ${p2} OR g.video_code ILIKE ${p3} OR v.name ILIKE ${p4})`);
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const order = sort === 'asc' ? 'ASC' : 'DESC';
 
-  const rows = db
-    .prepare(
-      `SELECT g.*, v.name AS video_name, p.username AS generated_by_username
-       FROM qr_generations g
-       JOIN videos v ON v.id = g.video_id
-       JOIN profiles p ON p.id = g.generated_by
-       ${whereClause}
-       ORDER BY g.generated_at ${order}`
-    )
-    .all(...params) as HistoryRow[];
+  const { rows } = await pool.query<HistoryRow>(
+    `SELECT g.*, v.name AS video_name, p.username AS generated_by_username
+     FROM qr_generations g
+     JOIN videos v ON v.id = g.video_id
+     JOIN profiles p ON p.id = g.generated_by
+     ${whereClause}
+     ORDER BY g.generated_at ${order}`,
+    params
+  );
 
   res.json(rows.map(serializeHistoryRow));
 });
